@@ -116,6 +116,8 @@ from kiro_crew.dashboard.session_directive_apply import apply_session_directive
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
     CRON_NOTIFY_RE,
+    HOOK_CONTINUATION_RECOVERY_PREFIX,
+    HOOK_HALTED_RECOVERY_PREFIX,
     NATIVE_SUBAGENT_DONE_RESULT_CAP,
     NATIVE_SUBAGENT_DONE_TRUNC_MARKER,
     NATIVE_SUBAGENT_OUTPUT_HARD,
@@ -135,6 +137,8 @@ from kiro_crew.dashboard.state import (
     build_stale_recovery_prompt,
     build_tool_stall_recovery_prompt,
     is_read_only_bash,
+    parse_hook_continuations,
+    should_queue_hook_continuation,
     should_queue_refusal_recovery,
     unsafe_bash_reason,
 )
@@ -3639,6 +3643,11 @@ async def _run_chat(
 ) -> None:
     """Stream LLM response into *slot*.  Survives browser disconnect."""
 
+    # Capture before any await: a Stop can complete while pre-turn setup is
+    # suspended and reset _stop_state to idle before continuation processing.
+    # The monotonic generation preserves that user intent across the whole call.
+    _stop_gen_at_entry = slot._stop_generation
+
     session_key = effective_session_key(slot)
     sessions = getattr(state, "sessions", None)
 
@@ -3673,6 +3682,7 @@ async def _run_chat(
         tool_name: str = "",
         tool_input: dict | None = None,
         tool_response: dict | None = None,
+        hook_continuation_count: int = 0,
     ) -> list[str]:
         """Fire script hooks. Returns stdout texts from exit-0 hooks (for context injection)."""
         injected: list[str] = []
@@ -3689,6 +3699,7 @@ async def _run_chat(
                 tool_input=tool_input,
                 tool_response=tool_response,
                 parent_session_key=session_key,
+                hook_continuation_count=hook_continuation_count,
             )
             for r in results:
                 if r.exit_code == 0 and r.stdout:
@@ -3913,6 +3924,17 @@ async def _run_chat(
     # the turn ends — and the user did not stop it — a recovery continuation is
     # enqueued so the model learns why and can adapt instead of stalling.
     _refusal_reasons: list[tuple[str, str]] = []
+    # Track how deep an unbroken hook-continuation run is, so the Stop hook can
+    # see it: each consecutive hook continuation is one deeper; any other turn
+    # (a real user message, a refusal recovery) breaks the run and resets it.
+    # Gate on synthetic provenance, not the marker text alone: a real dequeued
+    # continuation carries _synthetic_payload, but a user who types the marker
+    # verbatim is ordinary speech and must not inflate the depth a gate hook
+    # sees (would let a spoofed message drive the hook's self-limit).
+    if _synthetic_payload and message.startswith(HOOK_CONTINUATION_RECOVERY_PREFIX):
+        slot._hook_continuation_depth += 1
+    else:
+        slot._hook_continuation_depth = 0
     # Runner-authored continuations are orchestration, not user input, and the
     # post-fan-out synthesis prompt is one too: never mirror either to linked
     # surfaces (Slack/Telegram) as if the user typed it — only the assistant reply
@@ -7041,7 +7063,93 @@ async def _run_chat(
         # [:500]) so the tail — e.g. the harness [OPTIONS:] line — reaches both
         # the matcher and the hook body.
         _final = redact_credentials(redact_exfiltration_urls(assistant_text)[0])[0]
-        await _fire(HOOK_EVENT_STOP, _final)
+        # Report how deep this hook-continuation run is so a gate hook can
+        # diagnose or apply a stricter limit than the configurable backstop.
+        _stop_hook_out = await _fire(
+            HOOK_EVENT_STOP,
+            _final,
+            hook_continuation_count=slot._hook_continuation_depth,
+        )
+
+        # ── Stop-hook continuation ─────────────────────────────────────────
+        # A Stop hook that exits 0 and prints {"decision": "block", "reason":
+        # ...} asks the harness to continue with `reason` as the next message
+        # (https://kiro.dev/docs/hooks/types#agent-stop), so a hook can judge the
+        # finished turn and keep the session going — a test-gate hook, or one that
+        # auto-continues a trivial read — without a round-trip to the user.
+        # Suppressed on a user stop or a pending reset so a hook can never
+        # override the Stop button. A configurable consecutive-turn backstop
+        # bounds faulty always-block hooks; 0 explicitly disables that backstop.
+        # The finally block's dequeue loop dispatches accepted continuations.
+        if should_queue_hook_continuation(slot._stopping, needs_session_reset, _stop_reason) and (
+            # Suppress if any user stop was initiated during this turn (streaming,
+            # completion persistence, or the hook _fire above): stop_turn()
+            # reporting "idle" resets _stop_state before this guard reads
+            # _stopping, but _stop_generation counts stop INITIATIONS and never
+            # rewinds, so an entry-vs-now delta is the durable signal.
+            slot._stop_generation == _stop_gen_at_entry
+        ):
+            _hook_reasons = parse_hook_continuations(_stop_hook_out)
+            # No block decision -> nothing to queue; skip the cap load and
+            # arithmetic on the common empty path (also what the old
+            # `_hook_reasons and _nudge_cap` short-circuit did).
+            if _hook_reasons:
+                _nudge_cap = (
+                    await asyncio.to_thread(KiroCrewConfig.load)
+                ).agent.max_stop_hook_nudges
+                # Config loading yields to the event loop. Recheck the Stop
+                # boundary before mutating the queue so a Stop that lands during
+                # that await cannot be bypassed by the stale outer guard.
+                if not should_queue_hook_continuation(
+                    slot._stopping, needs_session_reset, _stop_reason
+                ) or slot._stop_generation != _stop_gen_at_entry:
+                    _hook_reasons = []
+            else:
+                _nudge_cap = 0
+            # The cap bounds TOTAL consecutive continuation turns, and one Stop
+            # event can carry several block reasons, so clamp to the remaining
+            # budget rather than checking depth once and queueing all of them.
+            # _hook_continuation_depth only counts turns that have RUN, so also
+            # subtract continuations already sitting in the queue from an earlier
+            # multi-reason event: they will run and add depth, and ignoring them
+            # lets each event recompute room from depth alone and overshoot.
+            _pending = sum(
+                1
+                for _it in slot._queue
+                if is_synthetic_recovery_item(_it)
+                and _it["content"].startswith(HOOK_CONTINUATION_RECOVERY_PREFIX)
+            )
+            _room = (
+                len(_hook_reasons)
+                if not _nudge_cap
+                else max(0, _nudge_cap - slot._hook_continuation_depth - _pending)
+            )
+            # queue_insert(0, …) prepends, so insert in reverse to keep several
+            # hooks' instructions in firing order.
+            for _reason in reversed(_hook_reasons[:_room]):
+                slot.queue_insert(
+                    0,
+                    f"{HOOK_CONTINUATION_RECOVERY_PREFIX}\n{_reason}",
+                    kind=SYNTHETIC_RECOVERY_KIND,
+                )
+            if _hook_reasons and _room < len(_hook_reasons):
+                # The run reached the cap: some (or all) reasons were refused.
+                # Surface an inject row (renders as a halt card carrying the
+                # reached depth) but dispatch nothing for the excess. This is the
+                # backstop against a buggy always-block hook looping an
+                # unattended session. `0` disables the cap entirely.
+                _dropped = len(_hook_reasons) - _room
+                slot.append(
+                    "inject",
+                    f"{HOOK_HALTED_RECOVERY_PREFIX} #{slot._hook_continuation_depth}\n"
+                    f"A Stop hook asked to continue, but this run reached "
+                    f"agent.max_stop_hook_nudges = {_nudge_cap} "
+                    f"(depth {slot._hook_continuation_depth}); {_dropped} nudge(s) "
+                    f"were dropped and the run was halted. Raise or disable the "
+                    f"cap in config to allow more.",
+                    "msg msg-inject",
+                )
+                state.push_slots_update()
 
         # ── Tool-refusal recovery ──────────────────────────────────────────
         # A recoverable refusal (host-gate policy deny or the read-only bash

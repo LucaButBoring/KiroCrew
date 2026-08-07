@@ -598,6 +598,11 @@ export default [
               // gate. Adding a marker here is a deliberate one-line act, which is
               // the right cost for adding one to the wire protocol.
               '^\\[(Subagent|Subagent batch|Workflow) completion event\\]$',
+              // The Stop-hook nudge-cap backstop marker (no em dash), enumerated
+              // for the same closed-set reason as the completion-event markers
+              // above. Matched with `startsWith` and sliced off before render;
+              // byte-identical to HOOK_HALTED_RECOVERY_PREFIX in state.py.
+              '^\\[Stop-hook nudge cap reached\\]$',
               // NOTE ON SHAPE: the plugin wraps every pattern as `^<pattern>$`
               // (`generateFullMatchRegExp`), so a pattern must describe the WHOLE
               // string. A prefix-only pattern like `^data:` becomes `^^data:$` and can

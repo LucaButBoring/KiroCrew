@@ -979,6 +979,24 @@ EMPTY_RESPONSE_RECOVERY_PREFIX = "[Empty response — automatic recovery]"
 # say "automatic recovery" like the five above: a person pressed the button, and
 # the card must not claim the system recovered by itself.
 MANUAL_RESUME_RECOVERY_PREFIX = "[Continue — requested by the user]"
+# Prefix on the continuation injected when a Stop hook returns a block decision
+# (`{"decision": "block", "reason": ...}` on exit-0 stdout). The reason IS the
+# instruction, handed back as the next turn so a hook can steer the session
+# without a round-trip to the user. Named into the *_RECOVERY_PREFIX family so
+# test_recovery_card_prefixes.py's drift guard sees it — a marker outside the
+# family renders as a full-width bubble instead of a card. The VALUE deliberately
+# does not say "recovery": the turn completed and a hook asked for another, so
+# nothing failed and nothing was recovered.
+HOOK_CONTINUATION_RECOVERY_PREFIX = "[Hook continuation — automatic]"
+# Prefix on the informational row surfaced when a Stop-hook continuation run hits
+# the `agent.max_stop_hook_nudges` cap: the next block decision is refused, no
+# turn is dispatched, and this row is appended instead so the transcript shows
+# the loop was force-stopped (with the reached depth as "#N"). Named into the
+# *_RECOVERY_PREFIX family so test_recovery_card_prefixes.py's drift guard sees
+# it — a marker outside the family renders as a full-width bubble, not a card.
+# The VALUE does not say "recovery": nothing failed or recovered, a safety cap
+# fired.
+HOOK_HALTED_RECOVERY_PREFIX = "[Stop-hook nudge cap reached]"
 
 
 def should_queue_refusal_recovery(
@@ -998,6 +1016,43 @@ def should_queue_refusal_recovery(
         and not needs_reset
         and stop_reason != STOP_REASON_CANCELLED
     )
+
+
+def should_queue_hook_continuation(stopping: bool, needs_reset: bool, stop_reason: str) -> bool:
+    """Decide whether a Stop hook's block decision may inject a continuation.
+
+    Mirrors :func:`should_queue_refusal_recovery`'s suppression set so a hook can
+    never override the Stop button: a stop in progress, a pending session reset,
+    or a user-cancelled turn all win over the hook.
+    """
+    return bool(not stopping and not needs_reset and stop_reason != STOP_REASON_CANCELLED)
+
+
+def parse_hook_continuations(stdouts: list[str]) -> list[str]:
+    """Extract continuation instructions from Stop-hook exit-0 stdout texts.
+
+    ``stdouts`` is what ``_fire`` returns for the Stop event: one entry per exit-0
+    hook, plus ``BLOCKED:`` markers for exit-2 denials. Only a well-formed block
+    decision carrying a non-blank ``reason`` contributes, because ``reason`` is
+    the message that gets injected — a block without one has nothing to say, so
+    the turn stops normally. Every other string is ignored, which is what keeps an
+    ordinary Stop hook that merely logs from continuing the session.
+    """
+    reasons: list[str] = []
+    for stdout in stdouts:
+        try:
+            decision = json.loads(stdout)
+        except (ValueError, TypeError, RecursionError):
+            # RecursionError is a RuntimeError, not a ValueError: json.loads
+            # raises it on deeply-nested input, and a pathological hook must not
+            # error an otherwise-successful turn.
+            continue
+        if not isinstance(decision, dict) or decision.get("decision") != "block":
+            continue
+        reason = decision.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            reasons.append(reason)
+    return reasons
 
 
 def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
@@ -1289,6 +1344,7 @@ class _ChatSlot:
         "_artifact",
         "_channel_folder_filed",
         "_resumed_count",
+        "_hook_continuation_depth",
         "_todo",
         "_on_message",
         "_on_question_retired",
@@ -1486,6 +1542,11 @@ class _ChatSlot:
         # Default filing is a first-surface action, not a recurring one.
         self._channel_folder_filed: bool = False
         self._resumed_count: int = 0  # messages loaded from history on resume
+        # Depth of the current unbroken Stop-hook continuation run: 0 on a normal
+        # turn, incremented on each consecutive hook-continuation turn, reset by
+        # any turn that is not a hook continuation. Surfaced to Stop hooks as
+        # `hook_continuation_count` for diagnostics or stricter hook-owned limits.
+        self._hook_continuation_depth: int = 0
         # Agent-authored TODO list, replaced wholesale from each todo_list tool
         # result (every command echoes the full list, so there is nothing to
         # merge). Shape: {description: str, tasks: [{id, text, completed}]}.

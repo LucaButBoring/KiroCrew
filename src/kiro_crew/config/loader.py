@@ -1456,6 +1456,16 @@ class AgentConfig:
             "below 3 would disable auto-sizing and run under the default).",
         ),
     )
+    max_stop_hook_nudges: int = field(
+        default=100,
+        metadata=_meta(
+            "Max Stop-hook nudges",
+            "Maximum consecutive Stop-hook block continuations before the run "
+            "halts and surfaces a halt card instead of dispatching another turn. "
+            "Bounds a buggy always-block hook in an unattended session. 0 = "
+            "uncapped (opt-in for genuinely unbounded feedback loops).",
+        ),
+    )
     spawn_min_memory_gb: float = field(
         default=4.0,
         metadata=_meta(
@@ -6041,6 +6051,9 @@ class KiroCrewConfig:
                 ),
                 session_sharing=bool(agent_data.get("session_sharing", True)),
                 max_subagents=agent_data.get("max_subagents", 0),
+                max_stop_hook_nudges=_safe_int(
+                    agent_data.get("max_stop_hook_nudges", 100), 100, 0
+                ),
                 subagent_mem_buffer_pct=_safe_int(
                     agent_data.get("subagent_mem_buffer_pct", 20), 20
                 ),

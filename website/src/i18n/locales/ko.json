@@ -7658,7 +7658,11 @@
         "tool_call_blocked": "도구 호출이 차단되었습니다",
         "tool_stopped_responding": "도구가 응답하지 않습니다",
         "turn_interrupted": "턴이 중단되었습니다",
-        "turn_stalled": "턴이 멈춰 있습니다"
+        "turn_stalled": "턴이 멈춰 있습니다",
+        "continued_by_a_hook": "훅에 의해 계속 진행했습니다",
+        "hook_requested_continuing": "훅에서 요청함 · 계속 진행 중",
+        "hook_loop_halted": "훅 루프가 중지되었습니다",
+        "nudge_cap_reached": "넛지 한도에 도달함"
       },
       "sessionColorPicker": {
         "change_your_color_palette_in_display_settings": "색상 팔레트는 표시 설정에서 변경할 수 있습니다",
