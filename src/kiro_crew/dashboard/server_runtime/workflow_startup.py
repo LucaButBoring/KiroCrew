@@ -104,11 +104,23 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
         _wf_concurrency = 4
         # The run ceiling is unaffected by that and IS config-driven.
         _wf_timeout_secs: int | None = None
+        _wf_max_depth: int | None = None
+        _wf_max_nested_runs: int | None = None
         try:
             cfg = await asyncio.to_thread(KiroCrewConfig.load)
             _wf_timeout_secs = int(cfg.agent.workflow_run_timeout_secs)
+            _wf_max_depth = int(cfg.agent.workflow_max_depth)
+            _wf_max_nested_runs = int(cfg.agent.workflow_max_nested_runs)
         except Exception:
             logger.debug("workflow run-ceiling config unavailable; using default", exc_info=True)
+
+        def _subagent_parent_session(session_key: str) -> str | None:
+            """The session that spawned sub-agent *session_key*, for run lineage."""
+            manager = getattr(state, "subagents", None)
+            if manager is None or not session_key.startswith("subagent:"):
+                return None
+            info = manager.get(session_key[len("subagent:") :])
+            return getattr(info, "parent_session_key", "") or None
 
         async def _wf_nudge_authorizer(
             *, slot_key: str, message: str, idle_secs: int, max_cycles: int
@@ -137,6 +149,9 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
             nudge_authorizer=_wf_nudge_authorizer,
             session_port=WorkflowSessionPort(state),
             timeout_secs=_wf_timeout_secs,
+            max_nesting_depth=_wf_max_depth,
+            max_nested_runs=_wf_max_nested_runs,
+            parent_session_of=_subagent_parent_session,
         )
         # Cancellation cannot stop a to_thread worker. Even if the factory
         # finishes while shutdown drains it, its result must remain unpublished.
