@@ -1,15 +1,16 @@
 """Depth and fan-out caps for workflow runs started from inside other runs.
 
 A run started from a session that belongs to no run is depth 1. A run started
-from one of run R's worker sessions, or from a sub-agent whose spawn chain
-leads back to one, is depth ``depth(R) + 1`` and counts against R's fan-out:
+from one of run R's worker sessions, from a session that ``run_of_session``
+maps to R (a saved task plan's step sessions), or from a sub-agent whose spawn
+chain leads back to either, is depth ``depth(R) + 1`` and counts against R's fan-out:
 the number of runs R has started that are still in flight. Admission refuses a
 start past either cap with an error. Without the caps one run can start runs
 that start runs, and the cascade outlives the run that began it.
 
 Lineage lives in process memory. Runs do not survive a gateway restart, so
-nothing in flight needs it afterwards; a parent run the ledger does not know is
-read as depth 1.
+nothing in flight needs it afterwards. A parent run the ledger does not know
+counts as depth 1, so a run started from it is depth 2.
 """
 
 from __future__ import annotations
@@ -63,7 +64,8 @@ class NestingLedger:
     """Each run's parent and depth, and the starts not yet registered.
 
     ``parent_session_of`` maps a sub-agent session key to the session that
-    spawned it, or ``None`` when it does not know the key.
+    spawned it, and ``run_of_session`` maps any other session key to the run it
+    works for; each returns ``None`` when it does not know the key.
     """
 
     def __init__(
@@ -72,12 +74,14 @@ class NestingLedger:
         max_depth: Optional[int] = None,
         max_nested_runs: Optional[int] = None,
         parent_session_of: Optional[Callable[[str], Optional[str]]] = None,
+        run_of_session: Optional[Callable[[str], Optional[str]]] = None,
     ) -> None:
         self.max_depth = _clamp(max_depth, DEFAULT_MAX_DEPTH, MAX_DEPTH_CEILING)
         self.max_nested_runs = _clamp(
             max_nested_runs, DEFAULT_MAX_NESTED_RUNS, MAX_NESTED_RUNS_CEILING
         )
         self._parent_session_of = parent_session_of
+        self._run_of_session = run_of_session
         self._depth: dict[str, int] = {}
         self._children: dict[str, set[str]] = {}
         self._pending: set[str] = set()
@@ -92,23 +96,29 @@ class NestingLedger:
         return self._depth.get(run_id, 0)
 
     def parent_run_of(self, session_key: str) -> str:
-        """The run *session_key* works for, directly or through sub-agents."""
+        """The run *session_key* works for, directly or through sub-agents, or ``""``."""
         key = session_key or ""
         for _ in range(_MAX_LINEAGE_HOPS):
-            run_id = run_id_of_worker_key(key)
+            run_id = run_id_of_worker_key(key) or self._lookup(self._run_of_session, key)
             if run_id:
                 return run_id
-            if not key.startswith(_SUBAGENT_PREFIX) or self._parent_session_of is None:
+            if not key.startswith(_SUBAGENT_PREFIX):
                 return ""
-            try:
-                parent = self._parent_session_of(key)
-            except Exception:  # noqa: BLE001 - an unreadable record reads as no parent
-                logger.debug("workflow lineage lookup failed for %s", key, exc_info=True)
-                return ""
+            parent = self._lookup(self._parent_session_of, key)
             if not parent or parent == key:
                 return ""
             key = parent
         return ""
+
+    @staticmethod
+    def _lookup(resolve: Optional[Callable[[str], Optional[str]]], key: str) -> str:
+        if resolve is None or not key:
+            return ""
+        try:
+            return resolve(key) or ""
+        except Exception:  # noqa: BLE001 - an unreadable record reads as no lineage
+            logger.debug("workflow lineage lookup failed for %s", key, exc_info=True)
+            return ""
 
     def admit(
         self, session_key: str, run_id: str, *, is_active: Callable[[str], bool]
@@ -120,7 +130,7 @@ class NestingLedger:
         whether a registered run is still in flight.
         """
         parent = self.parent_run_of(session_key)
-        depth = max(self._depth.get(parent, 1), 1) + 1 if parent else 1
+        depth = self._child_depth(parent)
         if depth > self.max_depth:
             logger.warning(
                 "workflow start refused: depth %d exceeds the cap of %d (parent run=%s)",
@@ -161,6 +171,36 @@ class NestingLedger:
         self._depth[run_id] = depth
         self._pending.add(run_id)
         return None
+
+    def record(self, session_key: str, run_id: str) -> None:
+        """Track *run_id* under its parent run without checking the caps.
+
+        For host runs (a task runner's shared run), which this ledger does not
+        admit: the task already runs, and tracking the host run keeps the
+        depth and fan-out of the runs its steps start.
+        """
+        if run_id in self._depth:
+            return
+        parent = self.parent_run_of(session_key)
+        self._depth[run_id] = self._child_depth(parent)
+        if parent:
+            self._children.setdefault(parent, set()).add(run_id)
+
+    def _child_depth(self, parent: str) -> int:
+        return max(self._depth.get(parent, 1), 1) + 1 if parent else 1
+
+    def rename(self, reserved_id: str, run_id: str) -> None:
+        """Move a reservation made before its run id existed onto *run_id*."""
+        depth = self._depth.pop(reserved_id, None)
+        if depth is not None:
+            self._depth[run_id] = depth
+        if reserved_id in self._pending:
+            self._pending.discard(reserved_id)
+            self._pending.add(run_id)
+        for siblings in self._children.values():
+            if reserved_id in siblings:
+                siblings.discard(reserved_id)
+                siblings.add(run_id)
 
     def settle(self, run_id: str, *, started: bool) -> None:
         """End *run_id*'s reservation; a start that produced no run is forgotten."""

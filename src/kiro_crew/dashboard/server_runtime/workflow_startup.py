@@ -122,6 +122,15 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
             info = manager.get(session_key[len("subagent:") :])
             return getattr(info, "parent_session_key", "") or None
 
+        def _task_plan_run_of_session(session_key: str) -> str | None:
+            """The shared run of the task whose step session is *session_key*."""
+            parts = session_key.split(":")
+            runner = getattr(state, "task_runner", None)
+            if runner is None or len(parts) < 3 or parts[0] != "taskrunner":
+                return None
+            run = runner._runs.get(parts[1])
+            return getattr(run, "workflow_run_id", "") or None
+
         async def _wf_nudge_authorizer(
             *, slot_key: str, message: str, idle_secs: int, max_cycles: int
         ) -> str | None:
@@ -152,6 +161,7 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
             max_nesting_depth=_wf_max_depth,
             max_nested_runs=_wf_max_nested_runs,
             parent_session_of=_subagent_parent_session,
+            run_of_session=_task_plan_run_of_session,
         )
         # Cancellation cannot stop a to_thread worker. Even if the factory
         # finishes while shutdown drains it, its result must remain unpublished.

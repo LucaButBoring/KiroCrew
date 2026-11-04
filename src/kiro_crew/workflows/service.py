@@ -222,6 +222,7 @@ class WorkflowService:
         max_nesting_depth: Optional[int] = None,
         max_nested_runs: Optional[int] = None,
         parent_session_of: Optional[Callable[[str], Optional[str]]] = None,
+        run_of_session: Optional[Callable[[str], Optional[str]]] = None,
         definition_library: Any = None,
         task_runner: Any = None,
         task_admission: Any = None,
@@ -279,6 +280,7 @@ class WorkflowService:
             max_depth=max_nesting_depth,
             max_nested_runs=max_nested_runs,
             parent_session_of=parent_session_of,
+            run_of_session=run_of_session,
         )
         self._nesting_subs = (
             live.bind("agent.workflow_max_depth", self._nesting.set_max_depth),
@@ -438,6 +440,7 @@ class WorkflowService:
             derived_from_revision=derived_from_revision,
         )
         await self.registry.register_async(handle, persist=False)
+        self._nesting.record(session_key, run_id)
         stream = EventStream(run_id)
         self._host_streams[run_id] = stream
         script_hash = hashlib.sha256(source.encode("utf-8")).hexdigest() if source else ""
@@ -1517,13 +1520,28 @@ class WorkflowService:
                     "error": "task runner is not available for this workflow",
                     "unavailable": True,
                 }
-            started = await self._task_runner.start_workflow_definition(
-                definition,
-                input_text=effective_input,
-                author=author,
-                session_key=session_key or author,
-                execution_context=captured_execution,
+            # The task runner allocates the run id, so the reservation is
+            # made under a placeholder and moved onto the id it returns.
+            reserved = f"task-plan:{secrets.token_hex(8)}"
+            refusal = self._nesting.admit(
+                session_key or author, reserved, is_active=self._run_active
             )
+            if refusal is not None:
+                return refusal
+            run_id = ""
+            try:
+                started = await self._task_runner.start_workflow_definition(
+                    definition,
+                    input_text=effective_input,
+                    author=author,
+                    session_key=session_key or author,
+                    execution_context=captured_execution,
+                )
+                run_id = str(started.get("run_id") or "")
+            finally:
+                if run_id:
+                    self._nesting.rename(reserved, run_id)
+                self._nesting.settle(run_id or reserved, started=bool(run_id))
             if "run_id" in started:
                 started.update(
                     {

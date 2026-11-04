@@ -146,6 +146,23 @@ def test_a_subagent_with_no_run_behind_it_starts_a_root_run() -> None:
     assert ledger.depth_of("wf_1") == 1
 
 
+def test_a_parent_run_the_ledger_does_not_know_counts_as_depth_one() -> None:
+    ledger = NestingLedger(max_depth=2)
+    assert ledger.admit("wf:wf_gone:0", "wf_2", is_active=_never_active) is None
+    assert ledger.depth_of("wf_2") == 2
+
+
+def test_a_renamed_reservation_keeps_its_depth_and_slot() -> None:
+    ledger = NestingLedger(max_nested_runs=1)
+    ledger.admit("dashboard:main", "wf_1", is_active=_never_active)
+    assert ledger.admit("wf:wf_1:0", "task-plan:x", is_active=_never_active) is None
+    ledger.rename("task-plan:x", "wf_2")
+    ledger.settle("wf_2", started=True)
+    assert ledger.depth_of("wf_2") == 2
+    refusal = ledger.admit("wf:wf_1:0", "wf_3", is_active="wf_2".__eq__)
+    assert refusal is not None and refusal["error_code"] == ERROR_CODE_FANOUT
+
+
 def test_a_cycle_in_recorded_parents_ends_the_walk() -> None:
     parents = {"subagent:a": "subagent:b", "subagent:b": "subagent:a"}
     ledger = NestingLedger(parent_session_of=parents.get)
@@ -260,6 +277,102 @@ async def test_the_service_counts_depth_through_a_subagent() -> None:
     assert grandchild.get("error_code") == ERROR_CODE_DEPTH, grandchild
     for run_id in (root["run_id"], child["run_id"]):
         await _settle(svc, run_id)
+
+
+PLAN = {
+    "id": "wd_plan",
+    "slug": "plan",
+    "revision": 1,
+    "name": "plan",
+    "format": "task-plan",
+    "source": "tasks: []\n",
+}
+
+
+class _TaskRunner:
+    """Starts a saved task plan the way TaskRunner does: as a host run."""
+
+    def __init__(self) -> None:
+        self.svc: WorkflowService | None = None
+        self.started: list[str] = []
+
+    async def start_workflow_definition(self, definition, *, session_key, **_kw):
+        assert self.svc is not None
+        run_id = await self.svc.begin_host_run(
+            name="plan", source_format="task-plan", driver="taskrunner", session_key=session_key
+        )
+        self.started.append(run_id)
+        return {"task_id": f"t{len(self.started)}", "run_id": run_id}
+
+
+def _plan_service(**kw) -> tuple[WorkflowService, _TaskRunner]:
+    runner = _TaskRunner()
+    svc = _service(
+        task_runner=runner, definition_library=SimpleNamespace(get=lambda _ref: PLAN), **kw
+    )
+    runner.svc = svc
+    return svc, runner
+
+
+@pytest.mark.asyncio
+async def test_a_saved_task_plan_started_from_a_worker_is_capped() -> None:
+    svc, runner = _plan_service(max_nesting_depth=1)
+    root = await svc.start(QUICK, session_key="dashboard:main")
+    out = await svc.start_definition("plan", session_key=f"wf:{root['run_id']}:0")
+    assert out.get("error_code") == ERROR_CODE_DEPTH, out
+    assert runner.started == [], "a refused plan never reaches the task runner"
+    await _settle(svc, root["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_a_task_plan_counts_against_its_parents_fanout() -> None:
+    svc, runner = _plan_service(max_nested_runs=1)
+    root = await svc.start(QUICK, session_key="dashboard:main")
+    worker = f"wf:{root['run_id']}:0"
+    first = await svc.start_definition("plan", session_key=worker)
+    assert first.get("run_id") == runner.started[0], first
+    second = await svc.start_definition("plan", session_key=worker)
+    assert second.get("error_code") == ERROR_CODE_FANOUT, second
+    await _settle(svc, root["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_a_task_plan_step_session_continues_the_lineage() -> None:
+    steps: dict[str, str] = {}
+    svc, _runner = _plan_service(
+        max_nesting_depth=2,
+        run_of_session=lambda key: steps.get(key.rsplit(":", 1)[0]),
+    )
+    root = await svc.start(QUICK, session_key="dashboard:main")
+    plan = await svc.start_definition("plan", session_key=f"wf:{root['run_id']}:0")
+    assert svc.nesting.depth_of(plan["run_id"]) == 2
+    steps[f"taskrunner:{plan['task_id']}"] = plan["run_id"]
+    out = await svc.start(QUICK, session_key=f"taskrunner:{plan['task_id']}:task0")
+    assert out.get("error_code") == ERROR_CODE_DEPTH, out
+    await _settle(svc, root["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_a_task_run_started_from_a_worker_is_tracked() -> None:
+    """``task_run`` reaches ``begin_host_run`` directly: not refused, but tracked."""
+    steps: dict[str, str] = {}
+    svc = _service(
+        max_nesting_depth=2,
+        max_nested_runs=1,
+        run_of_session=lambda key: steps.get(key.rsplit(":", 1)[0]),
+    )
+    root = await svc.start(QUICK, session_key="dashboard:main")
+    worker = f"wf:{root['run_id']}:0"
+    host = await svc.begin_host_run(
+        name="task", source_format="task-plan", driver="taskrunner", session_key=worker
+    )
+    assert svc.nesting.depth_of(host) == 2
+    sibling = await svc.start(QUICK, session_key=worker)
+    assert sibling.get("error_code") == ERROR_CODE_FANOUT, sibling
+    steps["taskrunner:t9"] = host
+    from_step = await svc.start(QUICK, session_key="taskrunner:t9:task0")
+    assert from_step.get("error_code") == ERROR_CODE_DEPTH, from_step
+    await _settle(svc, root["run_id"])
 
 
 # ── the config knobs ───────────────────────────────────────────────────────

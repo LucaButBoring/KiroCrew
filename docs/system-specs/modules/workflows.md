@@ -685,7 +685,10 @@ None-guard, and `validate` rejects the inline unguarded dereference.
 `workflows/nesting.py::NestingLedger` caps runs started from inside other runs.
 A run started from a session that belongs to no run is depth 1. A run started
 from one of run R's worker sessions (`wf:`, `wf-pool:`, `wf-unpooled:` and
-`wf-worker:<R>:...`, the `nesting.WORKER_KEY_PREFIXES`) is `depth(R) + 1`. A
+`wf-worker:<R>:...`, the `nesting.WORKER_KEY_PREFIXES`) is `depth(R) + 1`, and
+so is a run started from a step session (`taskrunner:<task_id>:...`) of a task
+whose shared run is R (`WorkflowService(run_of_session=...)`, which the gateway
+wires to the task runner's runs). A
 `subagent:<id>` caller is followed through its recorded `parent_session_key`
 (`WorkflowService(parent_session_of=...)`, which the gateway wires to the
 subagent manager) until a worker key or a non-subagent key is reached, so
@@ -695,7 +698,13 @@ parents reads as no parent.
 
 `start`, `start_from_intent` and `rerun_subtree` call `NestingLedger.admit`
 just before `run_background`, with the caller's key (`caller_session` for a
-rerun). `admit` resolves the parent run, refuses a depth past
+rerun). `start_definition` checks a saved task plan before it reaches the task
+runner: the task runner allocates the shared run id, so the reservation is made
+under a placeholder and `NestingLedger.rename` moves it onto the returned id.
+`begin_host_run` calls `NestingLedger.record`, which tracks a host run under its
+parent without checking the caps: a task started with `task_run` from a worker
+session already runs, and tracking its shared run keeps its depth and fan-out
+for the runs its steps start. `admit` resolves the parent run, refuses a depth past
 `agent.workflow_max_depth` or a parent with `agent.workflow_max_nested_runs`
 children still in flight, and otherwise reserves the run under its parent. The
 check and the reservation run without a yield, so two starts cannot both take
@@ -706,8 +715,14 @@ run is also removed from its parent. A refusal is a returned error, never a
 queued start, so the HTTP handlers answer 400 and the `workflow_run` tool
 reports `workflow_run failed: ...`.
 
-Lineage is held in process memory only. Runs do not survive a gateway restart,
-and a parent run the ledger does not know is read as depth 1. Both caps are
+Lineage is held in process memory only. Runs do not survive a gateway restart.
+A parent run the ledger does not know counts as depth 1, so a run started from
+it is depth 2.
+
+Starts the ledger does not trace back to a run count as root runs: a run that a
+session opened with `ctx.open_session` starts, a run a cron job or webhook
+session starts, and a run started from a subagent whose ancestor record the
+subagent manager has already evicted. Both caps are
 bound live (`live.bind`) and clamped to 1..16 and 1..32 (`config.sections_defaults`
 owns the defaults and ceilings); a start is checked against the values in force
 when it is admitted.
