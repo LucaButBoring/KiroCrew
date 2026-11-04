@@ -22,6 +22,32 @@ if TYPE_CHECKING:
     )
 
 
+def subagent_parent_session(state: DashboardState, session_key: str) -> str | None:
+    """The session that spawned sub-agent *session_key*, for workflow run lineage."""
+    manager = getattr(state, "subagents", None)
+    if manager is None or not session_key.startswith("subagent:"):
+        return None
+    info = manager.get(session_key[len("subagent:") :])
+    return getattr(info, "parent_session_key", "") or None
+
+
+def workflow_run_of_session(state: DashboardState, session_key: str) -> str | None:
+    """The run a task step session or a run-opened dashboard session works for."""
+    parts = session_key.split(":")
+    if len(parts) >= 3 and parts[0] == "taskrunner":
+        runner = getattr(state, "task_runner", None)
+        run = runner._runs.get(parts[1]) if runner is not None else None
+        return getattr(run, "workflow_run_id", "") or None
+    workflows = getattr(state, "workflow_service", None)
+    if workflows is None or not workflows.nesting.tracks_opened_sessions:
+        return None
+    # A session's MCP calls carry its history key, which the slot lookup maps.
+    from kiro_crew.dashboard.session_control_parts.caller_access import caller_slot_key
+
+    slot_key = caller_slot_key(state, session_key)
+    return (workflows.nesting.opened_by(slot_key) or None) if slot_key else None
+
+
 async def _initialize_workflow_service(state: DashboardState) -> None:
     """Restore fully off the boot path; publish only on the owning loop."""
     service = None
@@ -104,9 +130,13 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
         _wf_concurrency = 4
         # The run ceiling is unaffected by that and IS config-driven.
         _wf_timeout_secs: int | None = None
+        _wf_max_depth: int | None = None
+        _wf_max_nested_runs: int | None = None
         try:
             cfg = await asyncio.to_thread(KiroCrewConfig.load)
             _wf_timeout_secs = int(cfg.agent.workflow_run_timeout_secs)
+            _wf_max_depth = int(cfg.agent.workflow_max_depth)
+            _wf_max_nested_runs = int(cfg.agent.workflow_max_nested_runs)
         except Exception:
             logger.debug("workflow run-ceiling config unavailable; using default", exc_info=True)
 
@@ -127,6 +157,15 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
                 logger.info("workflow ctx.nudge not armed for %s: %s", slot_key, error)
             return error
 
+        # This function runs with the server module's globals, so the lineage
+        # lookups are imported by name rather than read as module globals.
+        import functools
+
+        from kiro_crew.dashboard.server_runtime.workflow_startup import (
+            subagent_parent_session,
+            workflow_run_of_session,
+        )
+
         service = await WorkflowService.create(
             sessions=state.sessions,
             context_builder=state.context_builder,
@@ -137,6 +176,10 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
             nudge_authorizer=_wf_nudge_authorizer,
             session_port=WorkflowSessionPort(state),
             timeout_secs=_wf_timeout_secs,
+            max_nesting_depth=_wf_max_depth,
+            max_nested_runs=_wf_max_nested_runs,
+            parent_session_of=functools.partial(subagent_parent_session, state),
+            run_of_session=functools.partial(workflow_run_of_session, state),
         )
         # Cancellation cannot stop a to_thread worker. Even if the factory
         # finishes while shutdown drains it, its result must remain unpublished.

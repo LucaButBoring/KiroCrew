@@ -445,6 +445,7 @@ class Project:
 - `cancel(task_id)` cancels specific task; `cancel()` cancels all
 - Completed cron runs are pruned on new start; other completed runs retain bounded history.
 - `_tasks` cleaned in `finally` block (no leaks)
+- `POST /api/taskrunner` (`api_taskrunner_start`, which the `task_run` tool reaches) checks the caller against the workflow nesting caps before `start_background()` runs: a caller that works for a workflow run (a worker session, a task step, a subagent or an opened session of that run) is refused with the ledger's `error_code` when the new task's shared run would pass `agent.workflow_max_depth` or the parent run's `agent.workflow_max_nested_runs`. See [workflows: Nested runs](workflows.md#nested-runs).
 - `start_background()` and `execute_plan()` enforce `_MAX_CONCURRENT_TASKS` before changing run state, so rejected admission cannot leave a partially started run. With a task admission attached (below) the guard is skipped: the lane meters the steps, so an over-limit run queues instead of being refused.
 - Replanned steps also reset sessions after execution (no leaks in `_try_replan`)
 
