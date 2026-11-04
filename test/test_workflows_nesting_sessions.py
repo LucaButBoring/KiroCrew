@@ -23,7 +23,7 @@ from session_control_helpers import (  # noqa: F401 -- the autouse fixtures regi
 )
 
 from kiro_crew.dashboard.handlers.session_control import _inherit_workflow_lineage
-from kiro_crew.dashboard.server_runtime.workflow_startup import workflow_run_of_session
+from kiro_crew.dashboard.workflow_lineage import workflow_run_of_session
 from kiro_crew.dashboard.workflow_session_port import WorkflowSessionPort
 from kiro_crew.history import ConversationLog
 from kiro_crew.workflows.nesting import ERROR_CODE_DEPTH
